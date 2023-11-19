@@ -22,15 +22,59 @@ const port = 3000;
 app.use(helmet({ poweredBy: false }));
 
 app.use(
-  helmet.contentSecurityPolicy({
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"],
-      // Weitere Einstellungen hier
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'"],
+        fontSrc: ["'self'"],
+        imgSrc: ['data:', "'self'"],
+        // Add more directives as needed
+      },
     },
   })
 );
 
+app.use(helmet({
+  hsts: {
+    maxAge: 31536000, // 1 year in seconds
+    includeSubDomains: true,
+    preload: true,
+  },
+}));
+
+app.use(
+  helmet({
+    contentSecurityPolicy: false, // Disable Helmet's default CSP
+    hidePoweredBy: true, // Enable hiding the "X-Powered-By" header
+    xssFilter: true, // Enable XSS filtering
+    frameguard: { action: 'deny' }, // Enable clickjacking protection
+    expectCt: true, // Enable Certificate Transparency header
+    dnsPrefetchControl: { allow: false }, // Disable DNS prefetching
+    referrerPolicy: { policy: 'same-origin' }, // Set referrer policy
+    featurePolicy: {
+      features: {
+        geolocation: ["'none'"],
+      },
+    }, // Enable Feature Policy header
+    permittedCrossDomainPolicies: { permittedPolicies: 'none' }, // Disable Adobe Flash and Acrobat PDF plugins
+    hsts: {
+      maxAge: 31536000, // 1 year in seconds
+      includeSubDomains: true,
+      preload: true,
+    }, // Enable HSTS header
+    noSniff: true, // Enable X-Content-Type-Options header
+    permissionsPolicy: {
+      features: {
+        accelerometer: ["'none'"],
+        camera: ["'none'"],
+        microphone: ["'none'"],
+        geolocation: ["'none'"],
+      },
+    }, // Enable Permissions-Policy header
+  })
+);
 
 
 
