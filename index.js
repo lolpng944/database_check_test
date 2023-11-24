@@ -5,7 +5,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const axios = require('axios');
 const validator = require('validator');
-const { createHmac } = require('crypto');
+const bcrypt = require('bcrypt');
 const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken'); // Added JWT
 const fs = require('fs');
@@ -90,21 +90,15 @@ const registerLimiter = rateLimit({
   message: 'Zu viele Registrierungsanfragen von dieser IP-Adresse, bitte versuche es später erneut.',
 });
 
-const accountCreationLimiter = rateLimit({
+const accountCreationLimit = rateLimit({
   windowMs: 24 * 60 * 60 * 1000, // 24 Stunden (pro Tag)
   max: 1, // Maximal 2 Anfragen pro IP-Adresse pro Tag
   message: 'Sie haben bereits die maximale Anzahl von Benutzerkonten für heute erstellt.'
 });
 
 
-
-
 app.use(cors());
-
-
 app.use(bodyParser.json());
-
-
 app.set('trust proxy', ['loopback', 'linklocal', 'uniquelocal']);
 app.use(limiter);
 app.use(express.static('public'));
@@ -112,7 +106,7 @@ app.use(express.static('public'));
 
 // Mittelware, um Anfragen von nicht autorisierten Ursprüngen abzulehnen
 app.use((req, res, next) => {
-  const allowedOrigins = ['https://turbowarp.org', 'https://serve.gamejolt.net' ,'tw-editor://.' ,'https://w7f5hz-3000.csb.app'];
+  const allowedOrigins = ['https://turbowarp.org', 'https://serve.gamejolt.net' ,'tw-editor://.'];
   const origin = req.headers.origin;
 
 
@@ -126,8 +120,6 @@ app.use((req, res, next) => {
     return res.status(403).json({ error: 'no contents' });
   }
 });
-
-
 
 
 // Verwende ein zufälliges und sicheres Verschlüsselungsschlüssel
@@ -153,6 +145,7 @@ db.serialize(() => {
       id INTEGER PRIMARY KEY,
       username TEXT NOT NULL,
       password TEXT NOT NULL,
+      salt TEXT NOT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       coins INTEGER DEFAULT 0,
       all_coins_earned INTEGER DEFAULT 0,
@@ -225,6 +218,21 @@ function validateUserInput(username, password) {
 
   return null; // Eingabe ist gültig
 }
+
+
+function validateChangeCredentials(newPassword) {
+
+  const passwordRegex = /^(?=.*\d)(?=.*[a-z])(?=.*[A-Z])[\S]{8,20}$/;
+ 
+
+  if (!passwordRegex.test(newPassword)) {
+    return 'not valid password';
+  }
+
+
+  return null; // Eingabe ist gültig
+}
+
 
 const MAX_REQUEST_SIZE = 100; // Setze das gewünschte Zeichenlimit
 
@@ -398,15 +406,17 @@ app.post('/register', registerLimiter, (req, res) => {
     return res.status(400).json({ message: validationError });
   }
 
-  // Verwende ein sicheres Hashing-Verfahren (HMAC) für das Passwort
-  const hmac = createHmac('sha256', encryptionKey);
-  const hashedPassword = hmac.update(password).digest('hex');
+  // Generate a random salt
+  const saltRounds = 10;
+  const salt = bcrypt.genSaltSync(saltRounds);
 
- 
+  // Hash the password with the salt
+  const hashedPassword = bcrypt.hashSync(password, salt);
+
   getCountryCode(req.ip)
-   .then(countryCode => {
-    const fallbackCountryCode = 'Unknown';
-    const finalCountryCode = countryCode || fallbackCountryCode;
+    .then((countryCode) => {
+      const fallbackCountryCode = 'Unknown';
+      const finalCountryCode = countryCode || fallbackCountryCode;
 
       db.get('SELECT * FROM users WHERE username COLLATE NOCASE = ?', [username], (err, row) => {
         if (err) {
@@ -417,39 +427,36 @@ app.post('/register', registerLimiter, (req, res) => {
           return res.status(400).json({ message: 'Benutzername bereits vergeben.' });
         }
 
-        if (username === password()) {
-          return res.status(400).json({ message: 'username and password identical' });
+        if (username === password) {
+          return res.status(400).json({ message: 'Benutzername und Passwort dürfen nicht identisch sein.' });
         }
 
-        // When the IP address limit is not reached, create the user account
-        db.run('INSERT INTO users (username, password, country_code) VALUES (?, ?, ?)', [username, hashedPassword, finalCountryCode], err => {
-          if (err) {
-            return res.status(500).json({ message: 'Interner Serverfehler.' });
-          }
+        accountCreationLimit(req, res, () => {
+          // When the IP address limit is not reached, create the user account
+          db.run('INSERT INTO users (username, password, salt, country_code) VALUES (?, ?, ?, ?)', [
+            username,
+            hashedPassword,
+            salt,
+            finalCountryCode,
+          ], (err) => {
+            if (err) {
+              return res.status(500).json({ message: 'Interner Serverfehler.' });
+            }
 
-          accountCreationLimiter(req, res, () => {
-            checkActiveSessions(req, res, () => {
             const token = generateToken(username); // Generate a token upon successful registration
-            res.json({ message: 'Benutzerkonto erfolgreich erstellt.', token });
+            checkActiveSessions(req, res, () => {
+              res.json({ message: 'Benutzerkonto erfolgreich erstellt.', token });
             });
           });
         });
       });
-    })
-    
-   });
-
-
-
+    });
+});
 
 app.post('/login', registerLimiter, (req, res) => {
   const { username, password } = req.body;
 
-  // Verwende ein sicheres Hashing-Verfahren (HMAC) für das Passwort
-  const hmac = createHmac('sha256', encryptionKey);
-  const hashedPassword = hmac.update(password).digest('hex');
-
-  db.get('SELECT * FROM users WHERE username = ? AND password = ?', [username, hashedPassword], (err, row) => {
+  db.get('SELECT * FROM users WHERE username COLLATE NOCASE = ?', [username], (err, row) => {
     if (err) {
       return res.status(500).json({ message: 'Interner Serverfehler.' });
     }
@@ -457,11 +464,17 @@ app.post('/login', registerLimiter, (req, res) => {
     if (!row) {
       return res.status(401).json({ message: 'Ungültige Anmeldeinformationen.' });
     }
+
+    // Compare the entered password with the stored hashed password
+    if (!bcrypt.compareSync(password, row.password)) {
+      return res.status(401).json({ message: 'Ungültige Anmeldeinformationen.' });
+    }
+
     checkActiveSessions(req, res, () => {
-    const token = generateToken(username); // Generate a token upon successful login
-    res.json({ message: 'Anmeldung erfolgreich.', token });
+      const token = generateToken(username); // Generate a token upon successful login
+      res.json({ message: 'Anmeldung erfolgreich.', token });
+    });
   });
-});
 });
 
 
@@ -1075,7 +1088,7 @@ app.post('/reset-equipped-items/:token', (req, res) => {
  
 
   // Check if the user is valid
-  db.get('SELECT * FROM users WHERE username = ?', [username], (err, userRow) => {
+  db.get('SELECT coins FROM users WHERE username = ?', [username], (err, userRow) => {
     if (err) {
       return res.status(500).json({ message: 'Internal Server Error.' });
     }
@@ -1208,7 +1221,7 @@ app.post('/redeem-code/:token/:code', (req, res) => {
     const username = decoded.username;
 
 
-  db.get('SELECT * FROM users WHERE username = ?', [username], (err, userRow) => {
+  db.get('SELECT coins FROM users WHERE username = ?', [username], (err, userRow) => {
     if (err) {
       return res.status(500).json({ message: 'Interner Serverfehler.' });
     }
@@ -1226,22 +1239,6 @@ app.post('/redeem-code/:token/:code', (req, res) => {
 });
 });
 
-
-app.get('/highscores-coins', checkRequestSize, checkMaintenanceMode, (req, res) => {
-  db.all('SELECT username, all_coins_earned FROM users WHERE username != "Liquem" ORDER BY all_coins_earned DESC LIMIT 50', (err, rows) => {
-    if (err) {
-      return res.status(500).json({ message: 'Interner Serverfehler.' });
-    }
-
-    const highscores = rows.map(row => ({
-      username: row.username,
-      all_coins_earned: row.all_coins_earned
-    }));
-
-    res.json(highscores);
-  });
-});
-
 app.get('/global-place/:token', (req, res) => {
   const token = req.params.token;
 
@@ -1257,6 +1254,15 @@ app.get('/global-place/:token', (req, res) => {
 
     // The token is valid, and decoded contains the user information
     const username = decoded.username;
+
+    db.get('SELECT coins FROM users WHERE username = ?', [username], (err, userRow) => {
+      if (err) {
+        return res.status(500).json({ message: 'Interner Serverfehler.' });
+      }
+  
+      if (!userRow) {
+        return res.status(401).json({ message: 'Ungültige Anmeldeinformationen.' });
+      }
 
   db.get(
     'SELECT COUNT(*) AS place FROM users WHERE username != "Liquem" AND all_coins_earned >= (SELECT all_coins_earned FROM users WHERE username = ?)',
@@ -1277,7 +1283,79 @@ app.get('/global-place/:token', (req, res) => {
   );
 });
 });
+});
 
+app.get('/highscores-coins/:token', (req, res) => {
+
+  const token = req.params.token;
+
+  if (!token) {
+    return res.status(401).json({ message: 'Token is missing.' });
+  }
+
+  // Verify the token using the JWT secret key
+  jwt.verify(token, jwtSecret, (err, decoded) => {
+    if (err) {
+      return res.status(403).json({ message: 'Invalid token.' });
+    }
+
+    // The token is valid, and decoded contains the user information
+    const username = decoded.username;
+
+    db.get('SELECT coins FROM users WHERE username = ?', [username], (err, userRow) => {
+      if (err) {
+        return res.status(500).json({ message: 'Interner Serverfehler.' });
+      }
+  
+      if (!userRow) {
+        return res.status(401).json({ message: 'Ungültige Anmeldeinformationen.' });
+      }
+
+  db.all('SELECT username, all_coins_earned FROM users WHERE username != "Liquem" ORDER BY all_coins_earned DESC LIMIT 50', (err, rows) => {
+    if (err) {
+      return res.status(500).json({ message: 'Interner Serverfehler.' });
+    }
+
+    const highscores = rows.map(row => ({
+      username: row.username,
+      all_coins_earned: row.all_coins_earned
+    }));
+
+    res.json(highscores);
+  });
+});
+});
+});
+
+app.get('/server-time/:token', (req, res) => {
+  const token = req.params.token;
+
+  if (!token) {
+    return res.status(401).json({ message: 'Token is missing.' });
+  }
+
+  // Verify the token using the JWT secret key
+  jwt.verify(token, jwtSecret, (err, decoded) => {
+    if (err) {
+      return res.status(403).json({ message: 'Invalid token.' });
+    }
+
+    // The token is valid, and decoded contains the user information
+    const username = decoded.username;
+
+    db.get('SELECT coins FROM users WHERE username = ?', [username], (err, userRow) => {
+      if (err) {
+        return res.status(500).json({ message: 'Interner Serverfehler.' });
+      }
+  
+      if (!userRow) {
+        return res.status(401).json({ message: 'Ungültige Anmeldeinformationen.' });
+      }
+  const currentTimestamp = new Date().getTime();
+  res.json({ serverTime: currentTimestamp });
+});
+});
+});
 
 app.get('/user-count', (req, res) => {
   db.get('SELECT COUNT(*) AS userCount FROM users', (err, result) => {
@@ -1289,22 +1367,6 @@ app.get('/user-count', (req, res) => {
   });
 });
 
-app.get('/server-time', (req, res) => {
-  const currentTimestamp = new Date().getTime();
-  res.json({ serverTime: currentTimestamp });
-});
-
-app.get('/global-coin-average', (req, res) => {
-  db.get('SELECT AVG(all_coins_earned) AS average FROM users WHERE username != "Liquem"', (err, row) => {
-    if (err) {
-      return res.status(500).json({ message: 'Interner Serverfehler.' });
-    }
-
-    const averageCoins = row.average;
-
-    res.json({ averageCoins });
-  });
-});
 
 app.get('/user-profile/:token/:usernamed', (req, res) => {
   const { usernamed } = req.params;
@@ -1455,13 +1517,17 @@ rl.on('line', (input) => {
   }
 });
 
-app.post('/change-password/:token/:currentPassword/:newPassword', (req, res) => {
-  const { currentPassword, newPassword } = req.params;
+app.post('/change-password', (req, res) => {
+  const { token, currentPassword, newPassword } = req.body;
 
-  const token = req.params.token;
+  if (!token || !currentPassword || !newPassword) {
+    return res.status(400).json({ message: 'Please provide all required information.' });
+  }
 
-  if (!token) {
-    return res.status(401).json({ message: 'Token is missing.' });
+  const validationErrorNew = validateChangeCredentials(newPassword);
+
+  if (validationErrorNew) {
+    return res.status(400).json({ message: validationErrorNew });
   }
 
   // Verify the token using the JWT secret key
@@ -1470,46 +1536,51 @@ app.post('/change-password/:token/:currentPassword/:newPassword', (req, res) => 
       return res.status(403).json({ message: 'Invalid token.' });
     }
 
-    // The token is valid, and decoded contains the user information
     const username = decoded.username;
 
-
-  // Validiere die Eingabe
-  const currentPasswordError = validateUserInput(username, currentPassword);
-  const newPasswordError = validateUserInput(username, newPassword);
-
-  if (currentPasswordError || newPasswordError) {
-    return res.status(400).json({ message: 'Ungültige Eingabe.' });
-  }
-
-  // Hash das eingegebene aktuelle Passwort und vergleiche es mit dem in der Datenbank gespeicherten Hash
-  const hmac = createHmac('sha256', encryptionKey);
-  const currentPasswordHash = hmac.update(currentPassword).digest('hex');
-
-  db.get('SELECT * FROM users WHERE username = ? AND password = ?', [username, currentPasswordHash], (err, userRow) => {
-    if (err) {
-      return res.status(500).json({ message: 'Interner Serverfehler.' });
-    }
-
-    if (!userRow) {
-      return res.status(401).json({ message: 'Ungültiges aktuelles Passwort.' });
-    }
-
-    // Hash das neue Passwort
-    const newHmac = createHmac('sha256', encryptionKey);
-    const newHashedPassword = newHmac.update(newPassword).digest('hex');
-
-    // Aktualisiere das Passwort in der Datenbank
-    db.run('UPDATE users SET password = ? WHERE username = ?', [newHashedPassword, username], (err) => {
-      if (err) {
-        return res.status(500).json({ message: 'Interner Serverfehler beim Aktualisieren des Passworts.' });
+    // Fetch user information from the database
+    db.get('SELECT * FROM users WHERE username COLLATE NOCASE = ?', [username], (dbErr, user) => {
+      if (dbErr) {
+        console.error('Error checking user in the database:', dbErr);
+        return res.status(500).json({ message: 'Internal server error.' });
       }
 
-      res.json({ message: 'Passwort erfolgreich geändert.' });
+      if (!user) {
+        return res.status(404).json({ message: 'User not found.' });
+      }
+
+      // Verify the current password
+      if (!bcrypt.compareSync(currentPassword, user.password)) {
+        return res.status(401).json({ message: 'Invalid current password.' });
+      }
+
+      // Generate a new salt and hash the new password
+      const saltRounds = 10;
+      const salt = bcrypt.genSaltSync(saltRounds);
+      const hashedNewPassword = bcrypt.hashSync(newPassword, salt);
+
+      // Update the user's password and set token to 0 in the database
+      db.run('UPDATE users SET password = ?, salt = WHERE username = ?', [hashedNewPassword, salt, username], (updateErr) => {
+        if (updateErr) {
+          console.error('Error updating password in the database:', updateErr);
+          return res.status(500).json({ message: 'Internal server error.' });
+        }
+
+        // Set the token to 0 in the database upon successful password change
+        db.run('UPDATE tokens SET token = ? WHERE username = ?', [0, username], (tokenUpdateErr) => {
+          if (tokenUpdateErr) {
+            console.error('Error updating token in the database:', tokenUpdateErr);
+            return res.status(500).json({ message: 'Internal server error.' });
+          }
+
+          res.json({ message: 'Password changed successfully.' });
+        });
+      });
     });
   });
 });
-});
+
+  
 
 
 app.get('/verify-token/:token', (req, res) => {
@@ -1528,13 +1599,22 @@ app.get('/verify-token/:token', (req, res) => {
 
     // The token is valid, and decoded contains the user information
     const username = decoded.username;
+
+    db.get('SELECT coins FROM users WHERE username = ?', [username], async (err, userRow) => {
+      if (err) {
+        return res.status(500).json({ message: 'Interner Serverfehler.' });
+      }
+  
+      if (!userRow) {
+        return res.status(401).json({ message: 'Invalid token.' });
+      }
+
     res.json({
       message: `${username}`,
   });
 });
 });
-
-
+});
 
 app.listen(port, () => {
   console.log(`Server läuft auf Port ${port}`);
